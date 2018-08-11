@@ -32,23 +32,20 @@
 --  used a limited form of wildcards, e.g.:
 --  @x-gettext-po-files: po/*.po@
 --
---  [@x-gettext-domain-def@] Name of the macro, in which domain name
---  will be passed to the program. Default value is
---  @__MESSAGE_CATALOG_DOMAIN__@
---
---  [@x-gettext-msg-cat-def@] Name of the macro, in which path to the
---  message catalog will be passed to the program. Default value is
---  @__MESSAGE_CATALOG_DIR__@
---
--- The last two parameters are used to send configuration data to the
--- code during its compilation. The most common usage example is:
+-- The configured domain name and the location of the installed
+-- translation files can be imported from an automatically generated
+-- module named Paths_Hgettext_<pkgname> where <pkgname> is the name
+-- of your package with all hyphens replaced by underscores. This
+-- module exports the constants @messageCatalogDomain :: String@ and
+-- @messageCatalogDir :: FilePath@. You can use it like this:
 --
 --
--- > ...
+-- > import Paths_Hgettext_test_package
+-- >
 -- > prepareI18N = do
 -- >    setLocale LC_ALL (Just "")
--- >    bindTextDomain __MESSAGE_CATALOG_DOMAIN__ (Just __MESSAGE_CATALOG_DIR__)
--- >    textDomain __MESSAGE_CATALOG_DOMAIN__
+-- >    bindTextDomain messageCatalogDomain (Just messageCatalogDir)
+-- >    textDomain messageCatalogDomain
 -- >
 -- > main = do
 -- >    prepareI18N
@@ -73,8 +70,11 @@ module Distribution.Simple.I18N.GetText
     , gettextDefaultMain
     ) where
 
+import Distribution.Simple.I18N.GetText.Autogen
+
 import           Distribution.PackageDescription
 import           Distribution.Simple
+import           Distribution.Simple.BuildPaths
 import           Distribution.Simple.InstallDirs    as I
 import           Distribution.Simple.LocalBuildInfo
 import           Distribution.Simple.Setup
@@ -83,7 +83,7 @@ import           Distribution.Verbosity
 
 import           Control.Arrow                      (second)
 import           Control.Monad
-import           Data.List                          (nub, unfoldr)
+import           Data.List                          (unfoldr)
 import           Data.Maybe                         (fromMaybe, listToMaybe)
 import           System.Directory
 import           System.Exit
@@ -108,9 +108,10 @@ gettextDefaultMain = defaultMainWithHooks $ installGetTextHooks simpleUserHooks
 installGetTextHooks :: UserHooks -- ^ initial user hooks
                     -> UserHooks -- ^ patched user hooks
 installGetTextHooks uh =
-    uh { confHook = \a b -> do
-           lbi <- (confHook uh) a b
-           return (updateLocalBuildInfo lbi)
+    uh { buildHook = \pd lbi uh' bf -> do
+           let verbosity = fromFlag $ buildVerbosity bf
+           rewriteHgettextPathsModule pd lbi verbosity
+           (buildHook uh) pd lbi uh' bf
 
        , postInst = \args iflags pd lbi -> do
            postInst uh args iflags pd lbi
@@ -121,15 +122,16 @@ installGetTextHooks uh =
            installPOFiles (fromFlagOrDefault maxBound (copyVerbosity cflags)) lbi
        }
 
-
-updateLocalBuildInfo :: LocalBuildInfo -> LocalBuildInfo
-updateLocalBuildInfo l =
-    let sMap = getCustomFields l
-        [domDef, catDef] = map ($ sMap) [getDomainDefine, getMsgCatalogDefine]
-        dom = getDomainNameDefault sMap (getPackageName l)
-        tar = targetDataDir l
-        [catMS, domMS] = map (uncurry formatMacro) [(domDef, dom), (catDef, tar)]
-    in (appendCPPOptions [domMS,catMS] . appendExtension [EnableExtension CPP]) l
+rewriteHgettextPathsModule :: PackageDescription -> LocalBuildInfo -> Verbosity -> IO ()
+rewriteHgettextPathsModule pd lbi verbosity = do
+  let pathsModuleName = hgettextAutogenModuleName pd
+      autogenDir = autogenPackageModulesDir lbi
+      autogenModulePath = autogenDir </> pathsModuleName <.> "hs"
+      sMap = getCustomFields lbi
+      dom = getDomainNameDefault sMap (getPackageName lbi)
+      tar = targetDataDir lbi
+  createDirectoryIfMissingVerbose verbosity True autogenDir
+  rewriteFileEx verbosity autogenModulePath $ generatePathsModule pathsModuleName dom tar
 
 installPOFiles :: Verbosity -> LocalBuildInfo -> IO ()
 installPOFiles verb l =
@@ -156,31 +158,11 @@ installPOFiles verb l =
       -- with the 'msgfmt' tool
       mapM_ installFile filelist
 
-forBuildInfo :: LocalBuildInfo -> (BuildInfo -> BuildInfo) -> LocalBuildInfo
-forBuildInfo l f =
-    let a = l{localPkgDescr = updPkgDescr (localPkgDescr l)}
-        updPkgDescr x = x{library = updLibrary (library x),
-                          executables = updExecs (executables x)}
-        updLibrary Nothing  = Nothing
-        updLibrary (Just x) = Just $ x{libBuildInfo = f (libBuildInfo x)}
-        updExecs x = map updExec x
-        updExec x = x{buildInfo = f (buildInfo x)}
-    in a
-
-appendExtension :: [Extension] -> LocalBuildInfo -> LocalBuildInfo
-appendExtension exts l =
-    forBuildInfo l updBuildInfo
-    where updBuildInfo x = x{defaultExtensions = updExts (defaultExtensions x)}
-          updExts s = nub (s ++ exts)
-
-appendCPPOptions :: [String] -> LocalBuildInfo -> LocalBuildInfo
-appendCPPOptions opts l =
-    forBuildInfo l updBuildInfo
-    where updBuildInfo x = x{cppOptions = updOpts (cppOptions x)}
-          updOpts s = nub (s ++ opts)
-
-formatMacro :: Show a => [Char] -> a -> [Char]
-formatMacro name value = "-D" ++ name ++ "=" ++ (show value)
+hgettextAutogenModuleName :: PackageDescription -> String
+hgettextAutogenModuleName pd = let packagePart = map fixChar $ unPackageName $ packageName pd
+                               in "Paths_Hgettext_" ++ packagePart
+  where fixChar '-' = '_'
+        fixChar c = c
 
 targetDataDir :: LocalBuildInfo -> FilePath
 targetDataDir l =
@@ -201,12 +183,6 @@ findInParametersDefault al name def = (fromMaybe def . lookup name) al
 
 getDomainNameDefault :: [(String, String)] -> String -> String
 getDomainNameDefault al d = findInParametersDefault al "x-gettext-domain-name" d
-
-getDomainDefine :: [(String, String)] -> String
-getDomainDefine al = findInParametersDefault al "x-gettext-domain-def" "__MESSAGE_CATALOG_DOMAIN__"
-
-getMsgCatalogDefine :: [(String, String)] -> String
-getMsgCatalogDefine al = findInParametersDefault al "x-gettext-msg-cat-def" "__MESSAGE_CATALOG_DIR__"
 
 getPoFilesDefault :: [(String, String)] -> IO [String]
 getPoFilesDefault al = toFileList $ findInParametersDefault al "x-gettext-po-files" ""
