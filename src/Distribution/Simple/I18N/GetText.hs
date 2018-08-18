@@ -72,6 +72,7 @@ module Distribution.Simple.I18N.GetText
 
 import Distribution.Simple.I18N.GetText.Autogen
 
+import           Distribution.ModuleName
 import           Distribution.PackageDescription
 import           Distribution.Simple
 import           Distribution.Simple.BuildPaths
@@ -79,6 +80,7 @@ import           Distribution.Simple.InstallDirs    as I
 import           Distribution.Simple.LocalBuildInfo
 import           Distribution.Simple.Setup
 import           Distribution.Simple.Utils
+import           Distribution.Types.ForeignLib
 import           Distribution.Verbosity
 
 import           Control.Arrow                      (second)
@@ -108,7 +110,8 @@ gettextDefaultMain = defaultMainWithHooks $ installGetTextHooks simpleUserHooks
 installGetTextHooks :: UserHooks -- ^ initial user hooks
                     -> UserHooks -- ^ patched user hooks
 installGetTextHooks uh =
-    uh { buildHook = \pd lbi uh' bf -> do
+    uh { readDesc = fmap addAutogenModules <$> readDesc uh
+       , buildHook = \pd lbi uh' bf -> do
            let verbosity = fromFlag $ buildVerbosity bf
            rewriteHgettextPathsModule pd lbi verbosity
            (buildHook uh) pd lbi uh' bf
@@ -121,6 +124,26 @@ installGetTextHooks uh =
            postCopy uh args cflags pd lbi
            installPOFiles (fromFlagOrDefault maxBound (copyVerbosity cflags)) lbi
        }
+
+addAutogenModules :: GenericPackageDescription -> GenericPackageDescription
+addAutogenModules gpd = gpd { packageDescription = addToPackageDescription $ packageDescription gpd }
+  where addToPackageDescription pd = pd { library = addToLibrary pd <$> library pd
+                                        , subLibraries = addToLibrary pd <$> subLibraries pd
+                                        , executables = addToExecutable pd <$> executables pd
+                                        , foreignLibs = addToForeignLib pd <$> foreignLibs pd
+                                        , testSuites = addToTestSuite pd <$> testSuites pd
+                                        , benchmarks = addToBenchmark pd <$> benchmarks pd
+                                        }
+        addToLibrary pd lib = lib { libBuildInfo = addToBuildInfo pd $ libBuildInfo lib }
+        addToExecutable pd exe = exe { buildInfo = addToBuildInfo pd $ buildInfo exe }
+        addToForeignLib pd lib = lib { foreignLibBuildInfo = addToBuildInfo pd $
+                                                          foreignLibBuildInfo lib
+                                  }
+        addToTestSuite pd suite = suite { testBuildInfo = addToBuildInfo pd $ testBuildInfo suite }
+        addToBenchmark pd bm = bm { benchmarkBuildInfo = addToBuildInfo pd $ benchmarkBuildInfo bm }
+        addToBuildInfo pd bi = bi { autogenModules = fromString (hgettextAutogenModuleName pd)
+                                                     : autogenModules bi
+                                  }
 
 rewriteHgettextPathsModule :: PackageDescription -> LocalBuildInfo -> Verbosity -> IO ()
 rewriteHgettextPathsModule pd lbi verbosity = do
